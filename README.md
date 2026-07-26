@@ -1,49 +1,74 @@
 # gtlv-core
 
-极验（GeeTest）点选验证码求解的**纯 Rust functional core**。
+极验（GeeTest）点选验证码的推理核心，以纯 Rust 实现。
 
-只放**核心推理逻辑 + 领域数据类型**：
+对于一张验证码图像，本 crate 输出答案格的位置、各答案格与提示词各字的特征向量，以及提示词字数 k。
+特征到点击坐标的转换由调用方完成，其规格见[匹配契约](#匹配契约)一节。
 
-- **YOLO 检测**（nano ONNX，同一次前向出提示框 class 1 + 答案格 class 0）
-- **Siamese 特征提取**（NNEF，96² 输入、512-d 嵌入）
-- **编排**：NMS/Top-K 过滤、k-from-aspect（由提示框长宽比标定字数 k）、裁剪 + 特征提取
+- **检测**：YOLO（nano ONNX），单次前向同时给出提示框与答案格
+- **特征提取**：Siamese（NNEF），96×96 输入，输出 512 维嵌入
+- **字数标定**：依据提示框长宽比得出 k，不依赖检测到的答案格数量
 
-**无跨语言绑定、无网络 I/O、确定性**。各消费壳按自己的跨语言界面各写 wrapper，不在此复用边界层
-（functional-core / imperative-shell）：
+本 crate 不含网络 I/O 与跨语言绑定，行为确定。推理后端采用
+[tract](https://github.com/sonos/tract)，为纯 Rust 实现，不依赖 ONNX Runtime 或 CGO，
+可编译至 `wasm32-wasip1` 及各原生 target。
 
-- **wasm 壳**（`gtlv-go` 的 `rust-wasm`）：经 wazero 的字节 FFI（`wire` 序列化）供 Go 侧加载。
-- **pyo3 壳**（[`gtlv-py`](https://github.com/cca2878/gtlv-py)）：经 PyO3 直接把 core 类型转 Python 对象。
+## 用法
 
-推理后端为 [tract](https://github.com/sonos/tract)（纯 Rust、零 onnxruntime/CGO），可编 `wasm32-wasip1`
-或各原生 target。
+模型已内置，构造完成后即可求解。模型加载与图优化需数百毫秒，因此实例应在进程内复用。
 
-## 模型内嵌：core 是唯一来源
+```rust
+use gtlv_core::{Engine, PerfTimer};
 
-生产模型放 `modeldata/`，经 `include_bytes!` **编入 core**，`Engine::new()` 从内存字节加载
-（tract `model_for_read`）。因此：
+let engine = Engine::new()?;                     // 加载内置模型，每进程执行一次
+let timer = PerfTimer::new(false);               // 传入 true 可获得分阶段耗时
 
-- **各语言壳不各自维护模型**——依赖 core 即自动携带，无需外部文件、无需 FS 挂载、**无临时目录依赖**。
-- 换模型 = 换 `modeldata/` 后重编消费方产物（wasm 壳即 `make build-wasm`）。
-- 代价：产物含模型（wasm 模块约 28MB）。实测 wazero 加载 28MB 模块的冷/暖启与 2MB 版**几乎相同**
-  （6.4s / 2.1s）——模型是 data 段、非代码，AOT 编译量不变。
-- 无损压缩对训练后权重**无效**（实测 xz 相对 gzip 仅省 0.8%），故原样内嵌、不额外压缩。
+let result = engine.detect_and_extract(&image_bytes, 0.5, &timer)?;
 
-## 边界：core 只做推理，纯数学后处理归各壳
+let m = result.detections.len();                 // 答案格数量，含干扰字
+let k = result.prompt_features.len();            // 提示词字数
+for (detection, features) in result.detections.iter().zip(&result.answer_features) {
+    // detection.bbox 为原图像素坐标，features 为该答案格的 512 维嵌入
+}
+```
 
-core 的产物是**检测框 + 特征向量 + k**（见 [`types::DetectResult`]）。把提示词特征指派到答案框的
-**矩形最优指派**是纯数学后处理（欧氏距离 + 指派），不依赖推理引擎、不涉及跨语言边界，故
-**各壳按自己语言的惯用法各自实现**，core 只提供算法契约文档：见 [`docs/matching.md`](docs/matching.md)。
+`detections` 与 `answer_features` 一一对应且顺序一致；`prompt_features` 按提示词自左至右排列。
+若 `prompt_box` 为 `None`、k 不在 2 至 4 之间，或 m 小于 k，则表明该图像无法求解，应更换图像重试。
 
-## 复用方式
-
-开发期消费方用 **path 依赖**（相对路径）引入；core 稳定后可切 **git rev 依赖**锁版本。
+依赖声明：
 
 ```toml
-# 消费方 Cargo.toml
-gtlv-core = { path = "../../gtlv-core" }              # 开发期
-# gtlv-core = { git = "https://github.com/cca2878/gtlv-core", rev = "..." }  # 锁版本
+gtlv-core = { git = "https://github.com/cca2878/gtlv-core", rev = "..." }
+```
+
+由于模型体积超出 crates.io 的单包上限，本 crate 仅通过 git 依赖分发。
+
+## 模型内置
+
+模型经 `include_bytes!` 编入 crate，依赖本 crate 即自动获得，无需外部模型文件、文件系统挂载或
+临时目录，这一特性对 WASM 与移动端部署尤为重要。相应地，产物将包含约 26MB 模型数据
+（编译所得的 wasm 模块约为 28MB）。
+
+模型权重已经过压缩，再行无损压缩收效甚微，故以原始形式内置。更换模型的方式为替换 `modeldata/`
+下的文件并重新编译调用方产物。
+
+## 匹配契约
+
+将提示词指派至答案格的实现不在本 crate 内。该步骤为纯数学计算——欧氏距离与矩形最优指派——
+既不依赖推理引擎，也不涉及跨语言边界，宜由各调用方以其语言的惯用方式实现。
+
+算法规格见 [`docs/matching.md`](docs/matching.md)，其中包含前置校验、指派约束，以及影响结果正确性的
+精度要求（距离须以 f64 累加）。遵循该规格的不同语言实现将产生一致的点击顺序。
+
+## 构建
+
+Rust 版本及所需 target 由 `rust-toolchain.toml` 声明，rustup 将自动安装。
+
+```bash
+cargo test
+cargo build --release --target wasm32-wasip1   # 供 WASM 调用方使用
 ```
 
 ## 许可
 
-AGPL-3.0-only（与上游 Amorter/biliTicker_gt 及 gtlv 系一致）。
+[AGPL-3.0-only](./LICENSE)，与 gtlv 系其余项目及上游 Amorter/biliTicker_gt 保持一致。

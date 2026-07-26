@@ -157,7 +157,7 @@ impl YoloDetector {
             return;
         }
 
-        // total_cmp 而非 partial_cmp().unwrap()：后者遇 NaN 直接 panic。
+        // total_cmp 对 NaN 也是全序，置信度异常时不会 panic。
         boxes.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
 
         let mut kept: Vec<RawDetection> = Vec::new();
@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn nms_does_not_panic_on_nan_confidence() {
-        // 曾用 partial_cmp().unwrap()，NaN 会直接 panic。
+        // 置信度排序必须对 NaN 全序，否则模型给出异常分值时会 panic。
         let mut boxes = vec![
             det(0.0, 0.0, 10.0, 10.0, f32::NAN),
             det(50.0, 50.0, 60.0, 60.0, 0.7),

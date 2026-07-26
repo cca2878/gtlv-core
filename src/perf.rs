@@ -31,7 +31,7 @@ impl PerfTimer {
         if !self.enabled {
             return;
         }
-        // 计时失败不该拖垮求解，故锁中毒时静默跳过而非 unwrap。
+        // 计时不应影响求解，故锁中毒时静默跳过。
         let Ok(mut stages) = self.stages.lock() else {
             return;
         };
@@ -80,7 +80,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
             timer.stop("loop");
         }
-        // 若 start 重置累计值，这里只会拿到最后一段（约 5ms）。
+        // 累加语义要求拿到三段之和；只记最后一段的话约为 5ms。
         assert!(timer.elapsed_ms("loop") >= 12, "阶段耗时应累加");
     }
 

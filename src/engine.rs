@@ -8,14 +8,16 @@ use crate::siamese::SiameseExtractor;
 use crate::types::{BoundingBox, DetectResult, Detection, PerfTimings};
 use crate::yolo::YoloDetector;
 
-/// 答案框数量的宽松兜底（防病态爆框）。真实 m ≤ k+干扰数（现观测 k+1）。
-/// 不截到 k：gt 新格式网格含干扰字，去重交给 NMS、选 k 交给下游矩形指派。
+/// 答案格数量上限，用于限制检测异常时的框数。
+///
+/// 取值显著大于提示词字数：答案网格含有干扰字，格数通常多于字数。
+/// 重复框由 NMS 消除，应点击的格子由调用方的指派确定。
 const MAX_ANS: usize = 8;
 
 /// 由提示框长宽比标定提示词字数 k。
 ///
-/// **绝不能用检测到的答案格数推断 k**——gt 新格式的网格含干扰字（m 常为 k+1），
-/// 那正是旧实现的致命点。阈值经真机验证（451 张旧图 + 50 张新图，100%）。
+/// k 不得由检测到的答案格数量推断：答案网格含有不应点击的干扰字，格数通常多于字数
+/// （常见多一个），据此推断将导致点击错误。阈值取自真机样本，在 501 张图像上判定全部正确。
 pub fn prompt_char_count(width: f32, height: f32) -> usize {
     let aspect = width / height.max(1.0);
     if aspect < 1.95 {
@@ -42,7 +44,7 @@ impl Engine {
     const SIAMESE_MODEL: &'static [u8] = include_bytes!("../modeldata/siamese_feature.nnef.tgz");
 
     pub fn new() -> Result<Self> {
-        // 顺序加载：wasm guest 单线程，并行加载（thread::scope）是原生专利，此处用不上。
+        // 顺序加载：WASM guest 为单线程，无法借助 thread::scope 并行加载。
         let yolo = YoloDetector::new(Self::YOLO_MODEL, Self::YOLO_INPUT)?;
         let siamese = SiameseExtractor::new(Self::SIAMESE_MODEL)?;
         Ok(Self { yolo, siamese })
@@ -57,7 +59,7 @@ impl Engine {
     ) -> Result<DetectResult> {
         let total_start = std::time::Instant::now();
 
-        // 1. 解码一次，检测与后续裁剪共用（重复解码同一份字节纯属白做功）。
+        // 1. 解码一次，检测与后续裁剪共用同一份像素。
         timer.start("preprocess");
         let img = image::load_from_memory(image_bytes)?;
         timer.stop("preprocess");
@@ -79,7 +81,7 @@ impl Engine {
             .collect();
         YoloDetector::nms(&mut ans_boxes, 0.5);
         if ans_boxes.len() > MAX_ANS {
-            // total_cmp 而非 partial_cmp().unwrap()：后者遇 NaN 会 panic。
+            // total_cmp 对 NaN 也是全序，置信度异常时不会 panic。
             ans_boxes.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
             ans_boxes.truncate(MAX_ANS);
         }
@@ -95,7 +97,7 @@ impl Engine {
             prompt_char_count(pb.x_max - pb.x_min, pb.y_max - pb.y_min)
         });
 
-        // 3. 裁剪 + 特征提取。两个阶段分开计时（合起来计只会得到同一个数）。
+        // 3. 裁剪 + 特征提取，两个阶段各自计时。
         let mut out_detections: Vec<Detection> = Vec::new();
         let mut answer_features: Vec<Vec<f32>> = Vec::new();
         let mut prompt_features: Vec<Vec<f32>> = Vec::new();
@@ -123,7 +125,7 @@ impl Engine {
         }
 
         let out_prompt_box = prompt_box.as_ref().map(|pb| {
-            // 按【标定出的 k】等分提示框（不按 ans_boxes.len()）。
+            // 按标定出的字数 k 等分提示框。
             let seg_width = (pb.x_max - pb.x_min) / (k.max(1)) as f32;
             for i in 0..k {
                 let x_min = pb.x_min + i as f32 * seg_width;
@@ -161,7 +163,7 @@ impl Engine {
         })
     }
 
-    /// 裁剪一块并提取特征，裁剪与推理分别累加计时。
+    /// 裁剪指定区域并提取特征，裁剪与推理分别累加计时。
     fn extract(
         &self,
         img: &image::DynamicImage,
