@@ -1,0 +1,25 @@
+[package]
+name = "gtlv-core"
+version = "0.1.0"
+edition = "2021"
+description = "极验点选求解的纯 Rust functional core（YOLO 检测 + Siamese 特征 + 编排），无跨语言绑定/无 I/O，供 wasm 壳与 pyo3 壳各自复用"
+license = "AGPL-3.0-only"
+repository = "https://github.com/cca2878/gtlv-core"
+readme = "README.md"
+keywords = ["geetest", "captcha", "yolo", "siamese", "tract"]
+categories = ["computer-vision"]
+
+[lib]
+name = "gtlv_core"
+
+[dependencies]
+# 推理引擎（yolo=nano ONNX 加载，siamese=NNEF 加载）
+tract-onnx = "0.23"
+tract-nnef = "0.23"
+# 图像解码：仅验证码所需 png/jpeg
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+] }
+anyhow = "1"
+log = "0.4"

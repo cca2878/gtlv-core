@@ -1,0 +1,11 @@
+# Rust 构建输出
+/target/
+
+# 库 crate 惯例：Cargo.lock 不入库，交由各消费方锁定
+/Cargo.lock
+
+# 编辑器/系统
+.DS_Store
+*.swp
+.idea/
+.vscode/
