@@ -12,7 +12,7 @@
 （functional-core / imperative-shell）：
 
 - **wasm 壳**（`gtlv-go` 的 `rust-wasm`）：经 wazero 的字节 FFI（`wire` 序列化）供 Go 侧加载。
-- **pyo3 壳**（`gtlv-py`，规划中）：经 PyO3 直接把 core 类型转 Python 对象。
+- **pyo3 壳**（[`gtlv-py`](https://github.com/cca2878/gtlv-py)）：经 PyO3 直接把 core 类型转 Python 对象。
 
 推理后端为 [tract](https://github.com/sonos/tract)（纯 Rust、零 onnxruntime/CGO），可编 `wasm32-wasip1`
 或各原生 target。
