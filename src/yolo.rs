@@ -1,11 +1,12 @@
-// YOLO 目标检测模块
+//! YOLO 目标检测：letterbox 预处理 → 推理 → 反变换回原图坐标 → NMS。
+
 use anyhow::Result;
 use std::sync::Arc;
 use tract_onnx::prelude::*;
 
-/// 检测结果
+/// YOLO 的原始检测框（扁平坐标）。对外的聚合形态见 [`crate::types::Detection`]。
 #[derive(Debug, Clone)]
-pub struct Detection {
+pub struct RawDetection {
     pub x_min: f32,
     pub y_min: f32,
     pub x_max: f32,
@@ -14,19 +15,28 @@ pub struct Detection {
     pub class_id: i32,
 }
 
-/// YOLO 检测器
 pub struct YoloDetector {
     model: Arc<TypedRunnableModel>,
     input_shape: (usize, usize), // (height, width)
 }
 
-/// Letterbox 几何参数：正向缩放/填充量，以及反变换回原图坐标所需的原图尺寸。
+/// Letterbox 几何参数：正向缩放/填充量，以及反变换回原图所需的原图尺寸。
 struct Letterbox {
     scale: f32,
     pad_x: f32,
     pad_y: f32,
     orig_w: f32,
     orig_h: f32,
+}
+
+impl Letterbox {
+    /// 把 letterbox 空间的坐标反算回原图像素坐标，并钳制在图内。
+    fn to_original(&self, x: f32, y: f32) -> (f32, f32) {
+        (
+            ((x - self.pad_x) / self.scale).clamp(0.0, self.orig_w),
+            ((y - self.pad_y) / self.scale).clamp(0.0, self.orig_h),
+        )
+    }
 }
 
 impl YoloDetector {
@@ -45,61 +55,49 @@ impl YoloDetector {
         })
     }
 
-    pub fn detect(&self, image_bytes: &[u8], conf_threshold: f32) -> Result<Vec<Detection>> {
-        use image::ImageReader;
-        use std::io::Cursor;
-
-        // 解码图像
-        let img = ImageReader::new(Cursor::new(image_bytes))
-            .with_guessed_format()?
-            .decode()?;
-
+    /// 检测。接收**已解码**的图像——同一张图在一次求解里还要用于裁剪，解码只做一次。
+    pub fn detect(
+        &self,
+        img: &image::DynamicImage,
+        conf_threshold: f32,
+    ) -> Result<Vec<RawDetection>> {
         let orig_w = img.width() as f32;
         let orig_h = img.height() as f32;
         let (target_h, target_w) = self.input_shape;
         let target_w = target_w as f32;
         let target_h = target_h as f32;
 
-        // Letterbox 预处理（与 ultralytics 对齐）
-        // 计算缩放比例，保持宽高比
+        // Letterbox 预处理（与 ultralytics 对齐）：等比缩放 + 居中灰边填充。
+        // 插值用 Triangle(BILINEAR)，对齐 ultralytics 的 cv2.resize。
         let scale = (target_w / orig_w).min(target_h / orig_h);
         let new_w = (orig_w * scale).round() as u32;
         let new_h = (orig_h * scale).round() as u32;
-
-        // 等比缩放
-        // 使用 Triangle (BILINEAR) 插值，与 ultralytics 的 cv2.resize 对齐
         let resized = img.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle);
         let rgb = resized.to_rgb8();
 
-        // 计算填充量（居中填充）
         let pad_x = ((target_w - new_w as f32) / 2.0).round() as u32;
         let pad_y = ((target_h - new_h as f32) / 2.0).round() as u32;
 
-        // 创建 640×640 灰色画布并粘贴缩放图
         let tw = target_w as u32;
         let th = target_h as u32;
         let mut canvas = image::RgbImage::from_pixel(tw, th, image::Rgb([114u8, 114, 114]));
         image::imageops::overlay(&mut canvas, &rgb, pad_x as i64, pad_y as i64);
 
-        // 转换为 NCHW float32 格式
+        // 转 NCHW float32，归一化到 [0, 1]。
         let mut input_data = Vec::with_capacity(3 * th as usize * tw as usize);
         for c in 0..3 {
-            for y in 0..th as usize {
-                for x in 0..tw as usize {
-                    let pixel = canvas.get_pixel(x as u32, y as u32);
-                    input_data.push(pixel[c] as f32 / 255.0);
+            for y in 0..th {
+                for x in 0..tw {
+                    input_data.push(canvas.get_pixel(x, y)[c] as f32 / 255.0);
                 }
             }
         }
-
         let input_tensor: Tensor =
             tract_ndarray::Array4::from_shape_vec((1, 3, th as usize, tw as usize), input_data)?
                 .into();
 
-        // 推理
         let outputs = self.model.run(tvec!(input_tensor.into()))?;
 
-        // 后处理：解析输出并反 letterbox 到原图坐标
         let letterbox = Letterbox {
             scale,
             pad_x: pad_x as f32,
@@ -107,9 +105,7 @@ impl YoloDetector {
             orig_w,
             orig_h,
         };
-        let detections = self.parse_outputs(&outputs, conf_threshold, &letterbox)?;
-
-        Ok(detections)
+        self.parse_outputs(&outputs, conf_threshold, &letterbox)
     }
 
     fn parse_outputs(
@@ -117,7 +113,7 @@ impl YoloDetector {
         outputs: &[tract_onnx::prelude::TValue],
         conf_threshold: f32,
         lb: &Letterbox,
-    ) -> Result<Vec<Detection>> {
+    ) -> Result<Vec<RawDetection>> {
         let mut detections = Vec::new();
 
         if outputs.is_empty() {
@@ -126,35 +122,28 @@ impl YoloDetector {
 
         let output = outputs[0].to_plain_array_view::<f32>()?;
 
-        // YOLO26 端到端输出格式：[batch, num_detections, 6]
-        // 每个检测：[x1, y1, x2, y2, confidence, class_id]（在 640×640 letterbox 空间）
+        // YOLO26 端到端输出：[batch, num_detections, 6]
+        // 每项 [x1, y1, x2, y2, confidence, class_id]（letterbox 空间）。
         if output.ndim() >= 3 {
             let num_dets = output.shape()[1];
             for i in 0..num_dets {
                 let conf = output[[0, i, 4]];
-                if conf < conf_threshold {
+                // 必须显式排除非有限值：`NaN < threshold` 恒为 false，单靠阈值比较会让
+                // NaN 混进结果，再在后续按置信度排序时炸掉。
+                if !conf.is_finite() || conf < conf_threshold {
                     continue;
                 }
 
-                let x1 = output[[0, i, 0]];
-                let y1 = output[[0, i, 1]];
-                let x2 = output[[0, i, 2]];
-                let y2 = output[[0, i, 3]];
-                let class_id = output[[0, i, 5]] as i32;
+                let (x_min, y_min) = lb.to_original(output[[0, i, 0]], output[[0, i, 1]]);
+                let (x_max, y_max) = lb.to_original(output[[0, i, 2]], output[[0, i, 3]]);
 
-                // 反 letterbox：去除填充 → 除以缩放比 → 回到原图坐标
-                let x_min = ((x1 - lb.pad_x) / lb.scale).max(0.0).min(lb.orig_w);
-                let y_min = ((y1 - lb.pad_y) / lb.scale).max(0.0).min(lb.orig_h);
-                let x_max = ((x2 - lb.pad_x) / lb.scale).max(0.0).min(lb.orig_w);
-                let y_max = ((y2 - lb.pad_y) / lb.scale).max(0.0).min(lb.orig_h);
-
-                detections.push(Detection {
+                detections.push(RawDetection {
                     x_min,
                     y_min,
                     x_max,
                     y_max,
                     confidence: conf,
-                    class_id,
+                    class_id: output[[0, i, 5]] as i32,
                 });
             }
         }
@@ -162,26 +151,19 @@ impl YoloDetector {
         Ok(detections)
     }
 
-    /// 对 class 0 框做 NMS
-    pub fn nms(boxes: &mut Vec<Detection>, iou_threshold: f32) {
+    /// 按置信度降序做 NMS，抑制 IoU 超阈值的重复框。
+    pub fn nms(boxes: &mut Vec<RawDetection>, iou_threshold: f32) {
         if boxes.len() <= 1 {
             return;
         }
 
-        // 按置信度降序排序
-        boxes.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+        // total_cmp 而非 partial_cmp().unwrap()：后者遇 NaN 直接 panic。
+        boxes.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
 
-        let mut kept = Vec::new();
-        for box_ in boxes.iter() {
-            let mut keep = true;
-            for k in &kept {
-                if iou(box_, k) > iou_threshold {
-                    keep = false;
-                    break;
-                }
-            }
-            if keep {
-                kept.push(box_.clone());
+        let mut kept: Vec<RawDetection> = Vec::new();
+        for candidate in boxes.iter() {
+            if kept.iter().all(|k| iou(candidate, k) <= iou_threshold) {
+                kept.push(candidate.clone());
             }
         }
 
@@ -189,14 +171,9 @@ impl YoloDetector {
     }
 }
 
-fn iou(a: &Detection, b: &Detection) -> f32 {
-    let xa = a.x_min.max(b.x_min);
-    let ya = a.y_min.max(b.y_min);
-    let xb = a.x_max.min(b.x_max);
-    let yb = a.y_max.min(b.y_max);
-
-    let inter_w = (xb - xa).max(0.0);
-    let inter_h = (yb - ya).max(0.0);
+fn iou(a: &RawDetection, b: &RawDetection) -> f32 {
+    let inter_w = (a.x_max.min(b.x_max) - a.x_min.max(b.x_min)).max(0.0);
+    let inter_h = (a.y_max.min(b.y_max) - a.y_min.max(b.y_min)).max(0.0);
     let inter_area = inter_w * inter_h;
 
     if inter_area == 0.0 {
@@ -207,4 +184,88 @@ fn iou(a: &Detection, b: &Detection) -> f32 {
     let area_b = (b.x_max - b.x_min) * (b.y_max - b.y_min);
 
     inter_area / (area_a + area_b - inter_area)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn det(x_min: f32, y_min: f32, x_max: f32, y_max: f32, confidence: f32) -> RawDetection {
+        RawDetection {
+            x_min,
+            y_min,
+            x_max,
+            y_max,
+            confidence,
+            class_id: 0,
+        }
+    }
+
+    #[test]
+    fn iou_is_zero_when_disjoint_and_one_when_identical() {
+        let a = det(0.0, 0.0, 10.0, 10.0, 1.0);
+        assert_eq!(iou(&a, &det(20.0, 20.0, 30.0, 30.0, 1.0)), 0.0);
+        assert!((iou(&a, &a) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn iou_matches_hand_computed_overlap() {
+        // 交 = 5x10 = 50，并 = 100 + 100 - 50 = 150。
+        let got = iou(
+            &det(0.0, 0.0, 10.0, 10.0, 1.0),
+            &det(5.0, 0.0, 15.0, 10.0, 1.0),
+        );
+        assert!((got - 50.0 / 150.0).abs() < 1e-6, "got {got}");
+    }
+
+    #[test]
+    fn nms_keeps_highest_confidence_and_drops_overlaps() {
+        let mut boxes = vec![
+            det(0.0, 0.0, 10.0, 10.0, 0.6),
+            det(0.5, 0.5, 10.5, 10.5, 0.9), // 与上面高度重叠，置信度更高
+            det(50.0, 50.0, 60.0, 60.0, 0.7), // 不重叠，应保留
+        ];
+        YoloDetector::nms(&mut boxes, 0.5);
+        assert_eq!(boxes.len(), 2);
+        assert_eq!(boxes[0].confidence, 0.9); // 按置信度降序
+        assert_eq!(boxes[1].confidence, 0.7);
+    }
+
+    #[test]
+    fn nms_does_not_panic_on_nan_confidence() {
+        // 曾用 partial_cmp().unwrap()，NaN 会直接 panic。
+        let mut boxes = vec![
+            det(0.0, 0.0, 10.0, 10.0, f32::NAN),
+            det(50.0, 50.0, 60.0, 60.0, 0.7),
+        ];
+        YoloDetector::nms(&mut boxes, 0.5);
+        assert_eq!(boxes.len(), 2);
+    }
+
+    #[test]
+    fn letterbox_inverts_padding_and_scaling() {
+        // 原图 300x150 → 384x384：scale=1.28，缩放后 384x192，上下各留 96 像素。
+        let lb = Letterbox {
+            scale: 1.28,
+            pad_x: 0.0,
+            pad_y: 96.0,
+            orig_w: 300.0,
+            orig_h: 150.0,
+        };
+        let (x, y) = lb.to_original(128.0, 96.0);
+        assert!((x - 100.0).abs() < 1e-3, "x={x}");
+        assert!(y.abs() < 1e-3, "y={y}"); // 填充起点映射回原图顶边
+    }
+
+    #[test]
+    fn letterbox_clamps_outside_original_bounds() {
+        let lb = Letterbox {
+            scale: 1.0,
+            pad_x: 0.0,
+            pad_y: 0.0,
+            orig_w: 100.0,
+            orig_h: 50.0,
+        };
+        assert_eq!(lb.to_original(-30.0, 999.0), (0.0, 50.0));
+    }
 }

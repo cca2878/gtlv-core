@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, main] # dev = snapshot verification; main = formal (post-merge)
+  pull_request:
+    branches: [main] # gate the dev -> main PR
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: lint · test · wasm build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Honor rust-toolchain.toml (pinned channel + components + targets) so CI
+      # uses the exact toolchain contributors build with — no version skew.
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test
+
+      # The crate has to stay buildable for wasm32-wasip1: that is how the Go
+      # shell consumes it, and wasm lacks APIs a native-only change might reach for.
+      - name: build for wasm32-wasip1
+        run: cargo build --release --target wasm32-wasip1
