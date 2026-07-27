@@ -14,6 +14,12 @@ use crate::yolo::YoloDetector;
 /// 重复框由 NMS 消除，应点击的格子由调用方的指派确定。
 const MAX_ANS: usize = 8;
 
+/// 调用方未指定时使用的检测置信度阈值。
+///
+/// 检测分数近乎二值：真答案格多在 0.8 以上，误检要到 0.005 以下才出现。取值落在这段空档里，
+/// 以召回笔画稀疏或贴边被截断的格；超量由 `MAX_ANS` 截断兜底。
+const DEFAULT_CONF_THRESHOLD: f32 = 0.1;
+
 /// 由提示框长宽比标定提示词字数 k。
 ///
 /// k 不得由检测到的答案格数量推断：答案网格含有不应点击的干扰字，格数通常多于字数
@@ -68,7 +74,7 @@ impl Engine {
         let conf_threshold = if conf_threshold > 0.0 {
             conf_threshold
         } else {
-            0.5
+            DEFAULT_CONF_THRESHOLD
         };
         let detections = self.yolo.detect(&img, conf_threshold)?;
         timer.stop("yolo_infer");
