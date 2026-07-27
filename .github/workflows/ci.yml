@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [dev, main] # dev = snapshot verification; main = formal (post-merge)
+    branches: [dev, main] # dev 为快照验证，main 为合并后的正式验证
   pull_request:
-    branches: [main] # gate the dev -> main PR
+    branches: [main] # dev -> main 的 PR 门禁
 
 permissions:
   contents: read
@@ -20,8 +20,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Honor rust-toolchain.toml (pinned channel + components + targets) so CI
-      # uses the exact toolchain contributors build with — no version skew.
+      # 遵循 rust-toolchain.toml（channel、components、targets 均已钉死），
+      # 使 CI 与贡献者本地用同一套工具链。
       - name: Install pinned Rust toolchain
         run: rustup show
 
@@ -36,7 +36,7 @@ jobs:
       - name: cargo test
         run: cargo test
 
-      # The crate has to stay buildable for wasm32-wasip1: that is how the Go
-      # shell consumes it, and wasm lacks APIs a native-only change might reach for.
+      # 本 crate 须保持可为 wasm32-wasip1 构建：Go 壳正是这样消费它的，
+      # 而 wasm 缺少一些只考虑原生时可能用到的 API。
       - name: build for wasm32-wasip1
         run: cargo build --release --target wasm32-wasip1
