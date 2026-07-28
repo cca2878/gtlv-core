@@ -1,6 +1,6 @@
 [package]
 name = "gtlv-core"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "gt 点选求解的纯 Rust functional core（YOLO 检测 + Siamese 特征 + 编排），无跨语言绑定/无 I/O，供 wasm 壳与 pyo3 壳各自复用"
 license = "AGPL-3.0-only"
