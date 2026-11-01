@@ -66,13 +66,18 @@ impl SiameseExtractor {
             .resize_exact(w as u32, h as u32, image::imageops::FilterType::Triangle)
             .to_rgb8();
 
-        let mut input_data = Vec::with_capacity(3 * h * w);
-        for c in 0..3 {
-            for y in 0..h {
-                for x in 0..w {
-                    input_data.push(rgb.get_pixel(x as u32, y as u32)[c] as f32 / 255.0);
-                }
-            }
+        let plane = h * w;
+        let mut input_data = vec![0.0f32; 3 * plane];
+        let (red, rest) = input_data.split_at_mut(plane);
+        let (green, blue) = rest.split_at_mut(plane);
+        for (pixel, ((r, g), b)) in rgb
+            .as_raw()
+            .chunks_exact(3)
+            .zip(red.iter_mut().zip(green.iter_mut()).zip(blue.iter_mut()))
+        {
+            *r = pixel[0] as f32 / 255.0;
+            *g = pixel[1] as f32 / 255.0;
+            *b = pixel[2] as f32 / 255.0;
         }
 
         Ok(tract_ndarray::Array4::from_shape_vec((1, 3, h, w), input_data)?.into())

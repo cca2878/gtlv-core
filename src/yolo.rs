@@ -80,16 +80,26 @@ impl YoloDetector {
 
         let tw = target_w as u32;
         let th = target_h as u32;
-        let mut canvas = image::RgbImage::from_pixel(tw, th, image::Rgb([114u8, 114, 114]));
-        image::imageops::overlay(&mut canvas, &rgb, pad_x as i64, pad_y as i64);
-
-        // 转 NCHW float32，归一化到 [0, 1]。
-        let mut input_data = Vec::with_capacity(3 * th as usize * tw as usize);
-        for c in 0..3 {
-            for y in 0..th {
-                for x in 0..tw {
-                    input_data.push(canvas.get_pixel(x, y)[c] as f32 / 255.0);
-                }
+        let plane = th as usize * tw as usize;
+        let mut input_data = vec![114.0f32 / 255.0; 3 * plane];
+        let (red, rest) = input_data.split_at_mut(plane);
+        let (green, blue) = rest.split_at_mut(plane);
+        for (y, row) in rgb
+            .as_raw()
+            .chunks_exact((new_w as usize * 3).max(1))
+            .enumerate()
+        {
+            let start = (pad_y as usize + y) * tw as usize + pad_x as usize;
+            let end = start + new_w as usize;
+            for (pixel, ((r, g), b)) in row.chunks_exact(3).zip(
+                red[start..end]
+                    .iter_mut()
+                    .zip(green[start..end].iter_mut())
+                    .zip(blue[start..end].iter_mut()),
+            ) {
+                *r = pixel[0] as f32 / 255.0;
+                *g = pixel[1] as f32 / 255.0;
+                *b = pixel[2] as f32 / 255.0;
             }
         }
         let input_tensor: Tensor =
